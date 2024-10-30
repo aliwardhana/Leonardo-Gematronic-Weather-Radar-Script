@@ -1,0 +1,148 @@
+from osgeo import osr
+import wradlib as wrl
+import numpy as np
+import matplotlib.pyplot as plt
+import warnings
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+def GEMA(listpcdfpath, radarpath, res, rmax, sweep):
+    f0 = wrl.util.get_wradlib_data_file(r'/content/drive/MyDrive/Data Penelitian/2023092101524300dBZ.vol')
+    raw = wrl.io.read_rainbow(f0)
+
+    try:
+        llon = float(raw['volume']['sensorinfo']['lon'])
+        llat = float(raw['volume']['sensorinfo']['lat'])
+        lalt = float(raw['volume']['sensorinfo']['alt'])
+    except:
+        llon = float(raw['volume']['radarinfo']['@lon'])
+        llat = float(raw['volume']['radarinfo']['@lat'])
+        lalt = float(raw['volume']['radarinfo']['@alt'])
+
+    res_coords = res / 111229.  # Convert resolution to degrees
+    xmax, xmin = llon + (rmax / 111229), llon - (rmax / 111229)
+    ymax, ymin = llat + (rmax / 111229), llat - (rmax / 111229)
+    n_grid = np.floor(((xmax - xmin) / res_coords) + 1)
+    n_grid = int(n_grid)
+    x_grid = np.linspace(xmax, xmin, n_grid)
+    y_grid = np.linspace(ymax, ymin, n_grid)
+
+    for fpath in listpcdfpath:
+        filename = fpath[len(radarpath)+1:]
+        f = wrl.util.get_wradlib_data_file(fpath)
+        raw = wrl.io.read_rainbow(f)
+
+        # Load site radar attributes
+        try:
+            llon = float(raw['volume']['sensorinfo']['lon'])
+            llat = float(raw['volume']['sensorinfo']['lat'])
+            lalt = float(raw['volume']['sensorinfo']['alt'])
+        except:
+            llon = float(raw['volume']['radarinfo']['@lon'])
+            llat = float(raw['volume']['radarinfo']['@lat'])
+            lalt = float(raw['volume']['radarinfo']['@alt'])
+        sitecoords = (llon, llat, lalt)
+
+        i = sweep
+        try:
+            elevation = float(raw['volume']['scan']['slice'][i]['posangle'])
+        except:
+            elevation = float(raw['volume']['scan']['slice'][0]['posangle'])
+        strsweep = str(i + 1)
+
+        # Load azimuth data
+        try:
+            azi = raw['volume']['scan']['slice'][i]['slicedata']['rayinfo']['data']
+            azidepth = float(raw['volume']['scan']['slice'][i]['slicedata']['rayinfo']['@depth'])
+            azirange = float(raw['volume']['scan']['slice'][i]['slicedata']['rayinfo']['@rays'])
+        except:
+            azi0 = raw['volume']['scan']['slice'][i]['slicedata']['rayinfo'][0]['data']
+            azi1 = raw['volume']['scan']['slice'][i]['slicedata']['rayinfo'][1]['data']
+            azi = (azi0 / 2) + (azi1 / 2)
+            del azi0, azi1
+            azidepth = float(raw['volume']['scan']['slice'][i]['slicedata']['rayinfo'][0]['@depth'])
+            azirange = float(raw['volume']['scan']['slice'][i]['slicedata']['rayinfo'][0]['@rays'])
+        try:
+            azires = float(raw['volume']['scan']['slice'][i]['anglestep'])
+        except:
+            azires = float(raw['volume']['scan']['slice'][0]['anglestep'])
+        azi = (azi * azirange / 2**azidepth) * azires
+
+        # Load range data
+        try:
+            stoprange = float(raw['volume']['scan']['slice'][i]['stoprange'])
+            rangestep = float(raw['volume']['scan']['slice'][i]['rangestep'])
+        except:
+            stoprange = float(raw['volume']['scan']['slice'][0]['stoprange'])
+            rangestep = float(raw['volume']['scan']['slice'][0]['rangestep'])
+        r = np.arange(0, stoprange, rangestep) * 1000
+
+        # Projection for lat and lon values
+        polargrid = np.meshgrid(r, azi)
+        xyz_pack = wrl.georef.polar.spherical_to_proj(polargrid[0], polargrid[1], elevation, sitecoords)
+        x = xyz_pack[:, :, 0]
+        y = xyz_pack[:, :, 1]
+
+        # Regridding
+        grid_xy = np.meshgrid(x_grid, y_grid)
+        xgrid = grid_xy[0]
+        ygrid = grid_xy[1]
+        grid_xy = np.vstack((xgrid.ravel(), ygrid.ravel())).transpose()
+        xy = np.concatenate([x.ravel()[:, None], y.ravel()[:, None]], axis=1)
+        radius = r[np.size(r) - 1]
+        center = [x.mean(), y.mean()]
+
+        # Load radar data
+        if fpath[-7:] == 'dBZ.vol':
+            print(f'Extracting data {filename} : SWEEP-{strsweep} at Elevation Angle {elevation}° ...')
+            data = raw['volume']['scan']['slice'][i]['slicedata']['rawdata']['data']
+            datadepth = float(raw['volume']['scan']['slice'][i]['slicedata']['rawdata']['@depth'])
+            datamin = float(raw['volume']['scan']['slice'][i]['slicedata']['rawdata']['@min'])
+            datamax = float(raw['volume']['scan']['slice'][i]['slicedata']['rawdata']['@max'])
+            data = datamin + data * (datamax - datamin) / 2 ** datadepth
+
+            # Data masking and preprocessing
+            clutter = wrl.clutter.filter_gabella(data, tr1=6, n_p=6, tr2=1.3, rm_nans=False)
+            try:
+                data_noclutter = wrl.ipol.interpolate_polar(data, clutter, ipclass=wrl.ipol.Linear)
+            except:
+                data_noclutter = data
+            data_dbz = data_noclutter
+
+            # Interpolating polar coordinate data to Cartesian coordinates
+            gridded_dbz = wrl.comp.togrid(xy, grid_xy, radius, center, data_dbz.ravel(), wrl.ipol.Linear)
+            gridded_datadbz = np.ma.masked_invalid(gridded_dbz).reshape((len(x_grid), len(y_grid)))
+
+        elif fpath[-5:] == 'V.vol':
+            print(f'Extracting data {filename} : SWEEP-{strsweep} at Elevation Angle {elevation}° ...')
+            data = raw['volume']['scan']['slice'][i]['slicedata']['rawdata']['data']
+            datadepth = float(raw['volume']['scan']['slice'][i]['slicedata']['rawdata']['@depth'])
+            datamin = float(raw['volume']['scan']['slice'][i]['slicedata']['rawdata']['@min'])
+            datamax = float(raw['volume']['scan']['slice'][i]['slicedata']['rawdata']['@max'])
+            data = datamin + data * (datamax - datamin) / 2 ** datadepth
+
+            # Interpolating polar coordinate data to Cartesian coordinates
+            gridded_v = wrl.comp.togrid(xy, grid_xy, radius, center, data.ravel(), wrl.ipol.Linear)
+            gridded_datav = np.ma.masked_invalid(gridded_v).reshape((len(x_grid), len(y_grid)))
+
+    return gridded_datadbz, gridded_datav, sitecoords, elevation, xgrid, ygrid, xmin, xmax, ymin, ymax
+
+def plot_radar_data(gridded_datadbz, xgrid, ygrid, elevation):
+    plt.figure(figsize=(10, 6))
+    # Create a meshgrid for the x and y coordinates
+    X, Y = np.meshgrid(xgrid, ygrid)
+
+    # Plot the data using pcolormesh
+    plt.pcolormesh(X, Y, gridded_datadbz, shading='auto', cmap='viridis')
+    plt.colorbar(label='Reflectivity (dBZ)')
+
+    # Set plot titles and labels
+    plt.title(f'Radar Reflectivity at {elevation}° Elevation Angle')
+    plt.xlabel('Longitude')
+    plt.ylabel('Latitude')
+
+    # Show the plot
+    plt.show()
